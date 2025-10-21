@@ -40,6 +40,16 @@ LAST_N=0
 # Pagination limit (prevent excessive API calls)
 MAX_PAGES=20
 
+# Temporary files for accumulating results safely (avoid long argument lists)
+ALL_PRS_FILE=$(mktemp -t all_prs)
+PRS_PAGE_FILE=$(mktemp -t prs_page)
+
+# Ensure temp files are removed on exit
+cleanup() {
+    rm -f "$ALL_PRS_FILE" "$PRS_PAGE_FILE" "${ALL_PRS_FILE}.tmp" 2>/dev/null || true
+}
+trap cleanup EXIT
+
 # ==============================================================================
 # Helper Functions
 # ==============================================================================
@@ -232,12 +242,12 @@ while [ "$HAS_MORE" = true ] && [ "$STOP_PAGINATION" = false ] && [ $PAGE -le $M
     else
         echo "   📄 Found $PAGE_COUNT PRs on page $PAGE"
         
-        # Merge PRs into ALL_PRS
-        if [ -z "$ALL_PRS" ]; then
-            ALL_PRS="$PRS_PAGE"
-        else
-            ALL_PRS=$(jq -n --argjson a "$ALL_PRS" --argjson b "$PRS_PAGE" '$a + $b')
+        # Write page to temp file and merge into accumulator file (using files to avoid argv limits)
+        echo "$PRS_PAGE" > "$PRS_PAGE_FILE"
+        if ! jq -s 'add' "$ALL_PRS_FILE" "$PRS_PAGE_FILE" > "${ALL_PRS_FILE}.tmp" 2>/dev/null; then
+            error_exit "Failed to process PRs (merge step). Try narrowing the range (use --last or a closer --since date)."
         fi
+        mv "${ALL_PRS_FILE}.tmp" "$ALL_PRS_FILE"
         
         # Check if we should stop pagination
         if [ "$MODE" = "since" ]; then
@@ -249,7 +259,7 @@ while [ "$HAS_MORE" = true ] && [ "$STOP_PAGINATION" = false ] && [ $PAGE -le $M
             fi
         else
             # Stop if we have enough merged PRs for --last mode
-            MERGED_COUNT=$(echo "$ALL_PRS" | jq '[.[]? | select(.merged_at != null)] | length' 2>/dev/null || echo "0")
+            MERGED_COUNT=$(jq '[.[]? | select(.merged_at != null)] | length' "$ALL_PRS_FILE" 2>/dev/null || echo "0")
             if [ "$MERGED_COUNT" -ge "$LAST_N" ]; then
                 echo "   ✅ Collected enough merged PRs ($MERGED_COUNT >= $LAST_N), stopping pagination"
                 STOP_PAGINATION=true
@@ -265,7 +275,7 @@ if [ $PAGE -gt $MAX_PAGES ]; then
 fi
 
 # Count total PRs fetched for reporting
-TOTAL_PRS_FETCHED=$(echo "$ALL_PRS" | jq '. | length' 2>/dev/null || echo "0")
+TOTAL_PRS_FETCHED=$(jq '. | length' "$ALL_PRS_FILE" 2>/dev/null || echo "0")
 if [ "$TOTAL_PRS_FETCHED" = "null" ] || [ -z "$TOTAL_PRS_FETCHED" ]; then
     TOTAL_PRS_FETCHED=0
 fi
@@ -284,13 +294,13 @@ echo ""
 # Filter PRs based on mode
 if [ "$MODE" = "since" ]; then
     # Filter by date
-    FOUND_PRS=$(echo "$ALL_PRS" | jq --arg since_date "$SINCE_DATE" '
+    FOUND_PRS=$(jq --arg since_date "$SINCE_DATE" '
         [.[]? | 
         select(.merged_at != null) | 
         select(.merged_at > $since_date)] | length
-    ' 2>/dev/null || echo "0")
+    ' "$ALL_PRS_FILE" 2>/dev/null || echo "0")
     
-    PR_LIST=$(echo "$ALL_PRS" | jq -r --arg since_date "$SINCE_DATE" --arg repo_path "$REPO_PATH" '
+    PR_LIST=$(jq -r --arg since_date "$SINCE_DATE" --arg repo_path "$REPO_PATH" '
         [.[]? | 
         select(.merged_at != null) | 
         select(.merged_at > $since_date)] |
@@ -299,16 +309,16 @@ if [ "$MODE" = "since" ]; then
         "#\(.number)|\(.title)" + 
         (if (.labels | length) > 0 then " [" + ([.labels[]?.name] | join(", ")) + "]" else "" end) + 
         "|https://github.com/\($repo_path)/pull/\(.number)"
-    ' 2>/dev/null || echo "")
+    ' "$ALL_PRS_FILE" 2>/dev/null || echo "")
 else
     # Take last N merged PRs
-    FOUND_PRS=$(echo "$ALL_PRS" | jq --arg last_n "$LAST_N" '
+    FOUND_PRS=$(jq --arg last_n "$LAST_N" '
         [.[]? | select(.merged_at != null)] | 
         length as $total |
         if $total >= ($last_n | tonumber) then ($last_n | tonumber) else $total end
-    ' 2>/dev/null || echo "0")
+    ' "$ALL_PRS_FILE" 2>/dev/null || echo "0")
     
-    PR_LIST=$(echo "$ALL_PRS" | jq -r --arg last_n "$LAST_N" --arg repo_path "$REPO_PATH" '
+    PR_LIST=$(jq -r --arg last_n "$LAST_N" --arg repo_path "$REPO_PATH" '
         [.[]? | select(.merged_at != null)] |
         sort_by(.merged_at) |
         reverse |
@@ -318,7 +328,7 @@ else
         "#\(.number)|\(.title)" + 
         (if (.labels | length) > 0 then " [" + ([.labels[]?.name] | join(", ")) + "]" else "" end) + 
         "|https://github.com/\($repo_path)/pull/\(.number)"
-    ' 2>/dev/null || echo "")
+    ' "$ALL_PRS_FILE" 2>/dev/null || echo "")
 fi
 
 # Display the PR list
